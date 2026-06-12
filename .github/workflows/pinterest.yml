@@ -1,29 +1,23 @@
 name: Pinterest Daily Publish
-
 on:
   schedule:
     - cron: "0 8 * * *"   # UTC 08:00 = 上海 16:00
     - cron: "0 14 * * *"  # UTC 14:00 = 上海 22:00 / 纽约 09:00
     - cron: "0 20 * * *"  # UTC 20:00 = 上海 04:00 / 伦敦 20:00
   workflow_dispatch:
-
 jobs:
   publish:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
-          pip install boto3 requests
-
+          pip install boto3 requests Pillow
       - name: Publish Pinterest pin
         env:
           R2_ENDPOINT:                  ${{ secrets.R2_ENDPOINT }}
