@@ -2,12 +2,13 @@
 """
 publish.py — Select next image from R2, generate caption, publish to Pinterest via Buffer GraphQL API
 每天触发3次，每周21个Pin，位置0带主页链接，位置10带产品页链接
-发布完成后发邮件报告到 163 邮箱
+图片自动裁切为 9:16 竖版
 """
 
 import json
 import os
 import sys
+import io
 import smtplib
 import boto3
 import requests
@@ -15,6 +16,8 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
+from urllib.parse import quote
+from PIL import Image
 
 # ── Config ────────────────────────────────────────────────────────────────────
 R2_ENDPOINT   = os.environ["R2_ENDPOINT"]
@@ -40,6 +43,12 @@ PRODUCT_PAGE_URL = "https://barekey.net/products/macbook-key-skin"
 WEEKLY_CYCLE     = 21
 HOMEPAGE_POS     = 0
 PRODUCT_PAGE_POS = 10
+
+PINTEREST_BOARD_ID = "1117174320005725402"
+
+# 输出尺寸 9:16
+OUTPUT_WIDTH  = 1080
+OUTPUT_HEIGHT = 1920
 
 
 # ── R2 helpers ────────────────────────────────────────────────────────────────
@@ -84,6 +93,60 @@ def save_state(s3, state: dict):
     )
 
 
+# ── Image processing ──────────────────────────────────────────────────────────
+def crop_to_9_16(s3, image_key: str) -> tuple[str, str]:
+    """
+    下载原图，居中裁切为 9:16，上传到 R2 _pinterest_tmp/，返回 (tmp_key, public_url)
+    """
+    # 下载
+    obj = s3.get_object(Bucket=R2_BUCKET, Key=image_key)
+    img_data = obj["Body"].read()
+    img = Image.open(io.BytesIO(img_data)).convert("RGB")
+
+    src_w, src_h = img.size
+    target_ratio = OUTPUT_WIDTH / OUTPUT_HEIGHT  # 9/16
+
+    src_ratio = src_w / src_h
+
+    if src_ratio > target_ratio:
+        # 图片太宽，按高度裁宽
+        new_w = int(src_h * target_ratio)
+        left = (src_w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, src_h))
+    else:
+        # 图片太高，按宽度裁高
+        new_h = int(src_w / target_ratio)
+        top = (src_h - new_h) // 2
+        img = img.crop((0, top, src_w, top + new_h))
+
+    # resize 到目标尺寸
+    img = img.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.LANCZOS)
+
+    # 保存到内存
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    buf.seek(0)
+
+    # 上传到 R2 临时目录
+    tmp_key = f"_pinterest_tmp/{Path(image_key).stem}_9x16.jpg"
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=tmp_key,
+        Body=buf.getvalue(),
+        ContentType="image/jpeg",
+    )
+
+    tmp_url = R2_PUBLIC_URL.rstrip("/") + "/" + quote(tmp_key, safe="/")
+    return tmp_key, tmp_url
+
+
+def delete_tmp(s3, tmp_key: str):
+    try:
+        s3.delete_object(Bucket=R2_BUCKET, Key=tmp_key)
+    except Exception:
+        pass
+
+
 # ── Link schedule ─────────────────────────────────────────────────────────────
 def get_link_for_pin(total_published: int) -> tuple[bool, str | None]:
     pos = total_published % WEEKLY_CYCLE
@@ -99,10 +162,19 @@ def create_pin_via_buffer(image_url: str, caption: str, link_url: str | None) ->
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        post {
-          id
-          status
+        ... on PostActionSuccess {
+          post {
+            id
+            status
+          }
         }
+        ... on MutationError {
+          message
+        }
+        ... on UnexpectedError {
+          message
+        }
+        __typename
       }
     }
     """
@@ -110,18 +182,25 @@ def create_pin_via_buffer(image_url: str, caption: str, link_url: str | None) ->
     variables = {
         "input": {
             "channelId": BUFFER_CHANNEL_ID,
-            "content": {
-                "text": caption,
-                "media": [{"url": image_url, "type": "IMAGE"}],
-            },
-            "publishingDetails": {
-                "publishNow": True,
+            "schedulingType": "automatic",
+            "mode": "shareNow",
+            "text": caption,
+            "assets": [
+                {
+                    "image": {
+                        "url": image_url,
+                    }
+                }
+            ],
+            "metadata": {
+                "pinterest": {
+                    "boardServiceId": PINTEREST_BOARD_ID,
+                    "title": "",
+                    **({"url": link_url} if link_url else {}),
+                }
             },
         }
     }
-
-    if link_url:
-        variables["input"]["content"]["link"] = link_url
 
     headers = {
         "Authorization": f"Bearer {BUFFER_TOKEN}",
@@ -138,10 +217,16 @@ def create_pin_via_buffer(image_url: str, caption: str, link_url: str | None) ->
 
     data = resp.json()
     if "errors" in data:
-        print(f"Buffer GraphQL errors: {json.dumps(data['errors'], indent=2)}")
-        raise RuntimeError("Buffer API returned errors")
+        raise RuntimeError("Buffer API errors: " + json.dumps(data["errors"]))
 
-    post_id = data["data"]["createPost"]["post"]["id"]
+    result = data["data"]["createPost"]
+    typename = result.get("__typename", "")
+    print(f"Buffer response type: {typename}")
+
+    if typename in ("MutationError", "UnexpectedError"):
+        raise RuntimeError(f"Buffer {typename}: {result.get('message', 'unknown error')}")
+
+    post_id = result.get("post", {}).get("id", "unknown")
     return post_id
 
 
@@ -207,14 +292,13 @@ def main():
     print(f"Found {len(all_images)} images across all groups")
 
     state = load_state(s3)
-    current_index  = state["index"] % len(all_images)
+    current_index   = state["index"] % len(all_images)
     total_published = state["total_published"]
-    cycle_pos      = total_published % WEEKLY_CYCLE
+    cycle_pos       = total_published % WEEKLY_CYCLE
 
     print(f"Cycle position: {cycle_pos + 1}/{WEEKLY_CYCLE}")
 
     image_key = all_images[current_index]
-    image_url = f"{R2_PUBLIC_URL.rstrip('/')}/{image_key}"
     print(f"Selected image: {image_key} (index {current_index}/{len(all_images)})")
 
     include_link, link_url = get_link_for_pin(total_published)
@@ -228,12 +312,17 @@ def main():
     caption = generate_caption(include_link=include_link, link_url=link_url)
     print(f"Caption:\n{caption}\n")
 
+    # 裁切图片为 9:16
+    print("Cropping image to 9:16...")
+    tmp_key, image_url = crop_to_9_16(s3, image_key)
+    print(f"Cropped image URL: {image_url}")
+
     try:
         print("Publishing via Buffer...")
         post_id = create_pin_via_buffer(image_url, caption, link_url)
         print(f"Published post ID: {post_id}")
 
-        state["index"]          = (current_index + 1) % len(all_images)
+        state["index"]           = (current_index + 1) % len(all_images)
         state["total_published"] = total_published + 1
         state["last_published"]  = datetime.utcnow().isoformat()
         state["last_post_id"]    = post_id
@@ -257,6 +346,10 @@ def main():
             error_msg=error_msg,
         )
         sys.exit(1)
+    finally:
+        # 无论成功失败都清理临时文件
+        delete_tmp(s3, tmp_key)
+        print(f"Cleaned up temp file: {tmp_key}")
 
 
 if __name__ == "__main__":
