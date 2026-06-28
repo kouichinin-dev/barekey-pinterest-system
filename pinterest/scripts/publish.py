@@ -27,7 +27,6 @@ import json
 import os
 import sys
 import io
-import random
 import smtplib
 import subprocess
 import tempfile
@@ -59,11 +58,12 @@ BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql"
 STATE_KEY          = "_system/pinterest-rotation-state.json"
 IMAGE_PREFIXES     = [str(i) + "/" for i in range(1, 16)]
 
-# Config files live in R2 (same convention as the TikTok/YouTube pipeline's
-# _config/product-info.md + _config/tiktok.json) instead of the repo checkout —
-# editable without a git push/redeploy.
-PRODUCT_INFO_KEY = "_config/pinterest-product-info.md"
-STYLE_GUIDE_KEY  = "_config/pinterest.json"
+# Config files：现在跟 TikTok/YouTube 读的是完全同一个 R2 key——product_info
+# 内容本来就一样，style guide 的 schema 也已经改成跟 TikTok 一致
+# （tone_notes/examples/core_hashtags），所以不再需要 Pinterest 专属的配置文件，
+# 也不需要任何额外的上传迁移。
+PRODUCT_INFO_KEY = "_config/product-info.md"
+STYLE_GUIDE_KEY  = "_config/tiktok.json"
 
 # Shared manual-asset library — same R2 paths the TikTok/YouTube/Snapchat
 # pipeline reads/writes. _manual/state.json already tracks "published"
@@ -547,9 +547,8 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
         print(f"  处理后的视频: {video_url}")
         verify_video_url_ready(video_url)
 
-        hashtag_pool = style["hashtags"]["primary"] + style["hashtags"]["secondary"]
-        random.shuffle(hashtag_pool)
-        hashtags = " ".join(hashtag_pool[:5])
+        # core_hashtags 跟 TikTok 一样是固定的——全部带上，不是从池子里随机抽。
+        hashtags = " ".join(style["core_hashtags"])
 
         if manual_caption_exists(s3, asset_id):
             caption_data = load_manual_caption_text(s3, asset_id)
@@ -672,6 +671,20 @@ def main():
     print(f"[{datetime.utcnow().isoformat()}] Pinterest publish starting")
 
     s3 = get_s3()
+
+    # ── 诊断 ──────────────────────────────────────────────────────────────
+    # 排查 NoSuchKey 用：确认实际连的是哪个 bucket/endpoint，以及 _config/
+    # 目录下真实存在哪些文件。问题解决后这段可以删掉。
+    print(f"[diag] R2_BUCKET   = {R2_BUCKET!r}")
+    print(f"[diag] R2_ENDPOINT = {R2_ENDPOINT!r}")
+    try:
+        resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix="_config/")
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        print(f"[diag] _config/ 下实际存在的文件: {keys}")
+    except Exception as e:
+        print(f"[diag] 列出 _config/ 失败: {e}")
+    # ── 诊断结束 ──────────────────────────────────────────────────────────
+
     rotation_state = load_state(s3)
 
     product_info = r2_read(s3, PRODUCT_INFO_KEY)
