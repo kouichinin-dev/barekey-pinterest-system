@@ -2,10 +2,16 @@
 """
 generate_caption.py — Generate Pinterest pin caption using DeepSeek API
 
-style guide 的 schema 现在完全跟 TikTok/YouTube 流水线一致——同一个 R2 key
+style guide 的 schema 跟 TikTok/YouTube 流水线一致——同一个 R2 key
 （_config/tiktok.json），同样的字段（tone_notes / examples / core_hashtags），
 同样的角度池机制（CAPTION_ANGLES / CAPTION_KNOWLEDGE_ANGLES）。Pinterest 不再
 有自己专属的风格指南文件。
+
+但 Pinterest 平台本身有一条 TikTok 没有的硬性限制——整条 Pin 文案（正文+
+hashtag）不能超过 500 字符，超了 Buffer 会直接拒绝发布。共用同一套 prompt
+结构后，模型容易被 TikTok 那种"自由发挥、写多段场景"的指令带偏，写出超长内容，
+所以这里加了"生成→检查长度→超了就重试→还超了就智能截断兜底"的保护，不能只靠
+prompt 里的字数建议。
 
 product_info 和 style 由 publish.py 从 R2 读出后传进来（同样是 TikTok/YouTube
 已经在用的 key：_config/product-info.md 和 _config/tiktok.json），这里不做
@@ -18,6 +24,12 @@ import requests
 
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+
+# Pinterest 平台硬性上限——超过这个数 Buffer 会直接拒绝发布（错误信息：
+# "Pinterest posts cannot exceed 500 characters"）。这是真实平台限制，不是
+# 风格建议，所以代码层面必须保证，不能只靠 prompt 里"建议"模型遵守。
+PINTEREST_MAX_CAPTION_CHARS = 500
+CAPTION_LENGTH_RETRIES = 2  # 超长时的重试次数，重试也用完了就走兜底裁切
 
 # 跟 TikTok/YouTube 流水线一样的角度池机制——每次显式指定一个具体角度，而不是
 # 让模型自己"随便发挥"，这才是真正打破文案雷同感的关键。
@@ -50,7 +62,10 @@ CAPTION_KNOWLEDGE_ANGLES = [
 ALL_CAPTION_ANGLES = CAPTION_ANGLES + CAPTION_KNOWLEDGE_ANGLES
 
 
-def generate_caption(product_info: str, style: dict, include_link: bool = False, link_url: str = None) -> str:
+def _generate_caption_body(product_info: str, style: dict, include_link: bool,
+                            link_url: str, max_body_chars: int) -> str:
+    """单次生成（不含hashtag）。max_body_chars 是这次尝试允许的正文字数上限——
+    重试时会逐次收紧这个数字，给模型更明确、更强硬的信号。"""
     examples_text = "\n\n".join(
         f'TITLE: {ex["title"]}\nDESCRIPTION: {ex["description"]}'
         for ex in style["examples"]
@@ -82,8 +97,9 @@ follows the same strict factual rules below — only claim what's in Product Inf
 {style['tone_notes']}
 
 ## Real examples from the brand's other content (study the voice and energy only — do NOT copy
-their structure, opening style, or length. These examples are NOT Pinterest-format, so also do
-NOT copy how they place hashtags):
+their structure, opening style, or length. These examples are from a DIFFERENT platform with a much
+higher character limit — Pinterest pin descriptions must be far shorter and written as ONE tight
+paragraph, not multiple short lines/beats):
 {examples_text}
 
 ## Required angle for THIS pin (do not reuse the angle from the examples above):
@@ -106,7 +122,12 @@ NOT copy how they place hashtags):
    says so in those exact terms.
 
 Write ONE Pinterest pin description now. Rules:
-- 150 to 300 characters for the main text (can be slightly longer for detail pins)
+- HARD LIMIT: this text must be under {max_body_chars} characters. Pinterest's platform itself
+  rejects any pin description over 500 characters total (and a fixed hashtag block gets appended
+  after your text), so going over {max_body_chars} characters here will cause the post to fail
+  outright. Stop well short of the limit — shorter is always safer than longer.
+- Write it as ONE tight paragraph (or two short sentences at most) — NOT multiple short lines or
+  separate beats like a script. A Pinterest description reads as a single flowing thought.
 - Mostly lowercase
 - 1-3 emoji max, placed naturally
 - Do NOT use markdown formatting
@@ -129,12 +150,58 @@ Write ONE Pinterest pin description now. Rules:
         timeout=30,
     )
     response.raise_for_status()
-    caption = response.json()["choices"][0]["message"]["content"].strip()
+    return response.json()["choices"][0]["message"]["content"].strip()
 
-    # core_hashtags 跟 TikTok 一样是固定的——每次全部带上，不是从池子里随机抽。
+
+def fit_caption_to_limit(body: str, hashtags: str, max_chars: int = PINTEREST_MAX_CAPTION_CHARS) -> str:
+    """保证最终发给Pinterest的文案（正文+hashtag）绝对不超过平台硬性上限。
+    优先裁正文，hashtag整段保留（hashtag本身短，裁了对发现力没什么意义）。
+    尽量在句子边界（. ! ?）截断，找不到合适的句子边界就退而求其次在单词边界
+    截断，不会硬切半个单词。"""
+    separator = "\n\n"
+    full = f"{body}{separator}{hashtags}"
+    if len(full) <= max_chars:
+        return full
+
+    budget_for_body = max_chars - len(separator) - len(hashtags)
+    if budget_for_body <= 0:
+        # 极端情况：hashtag本身就快把额度占满了，直接裁hashtag
+        return hashtags[:max_chars]
+
+    truncated = body[:budget_for_body]
+    sentence_ends = [truncated.rfind(p) for p in (". ", "! ", "? ", ".\n", "!\n", "?\n")]
+    best_cut = max(sentence_ends)
+    if best_cut > budget_for_body * 0.5:
+        truncated = truncated[:best_cut + 1]
+    else:
+        last_space = truncated.rfind(" ")
+        if last_space > 0:
+            truncated = truncated[:last_space]
+        truncated = truncated.rstrip() + "…"
+
+    return f"{truncated}{separator}{hashtags}"
+
+
+def generate_caption(product_info: str, style: dict, include_link: bool = False, link_url: str = None) -> str:
+    # core_hashtags 跟 TikTok 一样是固定的——全部带上，不是从池子里随机抽。
     hashtags = " ".join(style["core_hashtags"])
-    full_caption = f"{caption}\n\n{hashtags}"
-    return full_caption
+
+    # 留给正文的字数预算 = 总上限 - 分隔符 - hashtag长度，再留一点余量。
+    body_budget = PINTEREST_MAX_CAPTION_CHARS - len("\n\n") - len(hashtags) - 20
+
+    last_body = ""
+    for attempt in range(1, CAPTION_LENGTH_RETRIES + 2):  # 含首次尝试
+        # 每次重试都把允许的正文字数收紧一点，给模型更强硬的信号
+        target = max(150, body_budget - (attempt - 1) * 80)
+        body = _generate_caption_body(product_info, style, include_link, link_url, max_body_chars=target)
+        last_body = body
+        full = f"{body}\n\n{hashtags}"
+        if len(full) <= PINTEREST_MAX_CAPTION_CHARS:
+            return full
+        print(f"  ⚠️ 文案过长（{len(full)}字符 > {PINTEREST_MAX_CAPTION_CHARS}），"
+              f"第{attempt}次尝试，{'重试...' if attempt <= CAPTION_LENGTH_RETRIES else '改为裁切兜底。'}")
+
+    return fit_caption_to_limit(last_body, hashtags)
 
 
 if __name__ == "__main__":
@@ -166,4 +233,5 @@ if __name__ == "__main__":
     test_style        = _json.loads(_test_r2_read("_config/tiktok.json"))
 
     caption = generate_caption(test_product_info, test_style, include_link=include_link, link_url=link_url)
+    print(f"长度: {len(caption)} 字符\n")
     print(caption)
