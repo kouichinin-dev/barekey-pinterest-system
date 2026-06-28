@@ -485,7 +485,7 @@ def create_pin_via_buffer(media_url: str, caption: str, link_url: str | None,
         "input": {
             "channelId": BUFFER_CHANNEL_ID,
             "schedulingType": "automatic",
-            "mode": "shareNow",
+            "mode": "addToQueue",
             "text": caption,
             "assets": assets,
             "metadata": {
