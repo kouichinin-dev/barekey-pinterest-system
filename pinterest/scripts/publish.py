@@ -89,6 +89,7 @@ OUTPUT_WIDTH  = 1080
 OUTPUT_HEIGHT = 1920
 
 MIN_VALID_VIDEO_BYTES = 50_000  # 50KB —比这个还小基本就是空文件/坏文件
+MIN_VALID_IMAGE_BYTES = 5_000    # 5KB —封面图比这个还小基本是坏文件
 VIDEO_URL_CHECK_RETRIES = 6
 VIDEO_URL_CHECK_DELAY_SECONDS = 5
 
@@ -301,27 +302,78 @@ def upload_normalized_manual_video(s3, local_path: str, asset_id: str) -> tuple[
     return url, key
 
 
-def verify_video_url_ready(video_url: str) -> int:
-    """轮询公开URL，确认 R2 CDN 已生效且文件大小正常，避免 Buffer 抓到空文件。"""
+def verify_url_ready(url: str, min_bytes: int = MIN_VALID_VIDEO_BYTES, retries: int = VIDEO_URL_CHECK_RETRIES) -> int:
+    """轮询公开URL，确认 R2 CDN 已生效且文件大小正常。视频和封面图都用这个。"""
     last_error = None
-    for attempt in range(1, VIDEO_URL_CHECK_RETRIES + 1):
+    for attempt in range(1, retries + 1):
         try:
-            resp = requests.head(video_url, timeout=15, allow_redirects=True)
+            resp = requests.head(url, timeout=15, allow_redirects=True)
             content_length = int(resp.headers.get("Content-Length", 0))
-            if resp.status_code == 200 and content_length >= MIN_VALID_VIDEO_BYTES:
-                print(f"  视频URL已就绪: {content_length} bytes (第{attempt}次检查)")
+            if resp.status_code == 200 and content_length >= min_bytes:
+                print(f"  URL已就绪: {content_length} bytes (第{attempt}次检查) — {url}")
                 return content_length
             last_error = f"status={resp.status_code}, content_length={content_length}"
         except Exception as e:
             last_error = str(e)
 
-        print(f"  视频URL还没就绪 (第{attempt}/{VIDEO_URL_CHECK_RETRIES}次): {last_error}")
-        if attempt < VIDEO_URL_CHECK_RETRIES:
+        print(f"  URL还没就绪 (第{attempt}/{retries}次): {last_error}")
+        if attempt < retries:
             time.sleep(VIDEO_URL_CHECK_DELAY_SECONDS)
 
-    raise RuntimeError(
-        f"视频URL在{VIDEO_URL_CHECK_RETRIES}次检查后仍未就绪: {video_url} ({last_error})"
-    )
+    raise RuntimeError(f"URL在{retries}次检查后仍未就绪: {url} ({last_error})")
+
+
+def verify_video_url_ready(video_url: str) -> int:
+    return verify_url_ready(video_url, min_bytes=MIN_VALID_VIDEO_BYTES)
+
+
+def extract_video_thumbnail(video_path: str, tmpdir: str, seek_seconds: float = 0.5) -> str:
+    """从视频里截一帧当 Pinterest 视频Pin的封面图。Buffer 的 Pinterest 接口
+    报错明确要求视频Pin也必须带至少一张image asset——不会像Buffer网页版那样
+    自动帮你截帧，所以这一步得自己做。
+
+    默认从第0.5秒截（避开很多视频开头的黑场/淡入），如果视频比这还短就退到
+    第0秒重试一次。
+    """
+    output_path = os.path.join(tmpdir, "thumbnail.jpg")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(seek_seconds),
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        output_path,
+    ]
+    print(f"  正在从第{seek_seconds}秒截取封面图...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    ok = result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) >= MIN_VALID_IMAGE_BYTES
+    if not ok:
+        print("  截帧失败或视频太短，退到第0秒重试...")
+        cmd0 = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-q:v", "2",
+            output_path,
+        ]
+        result0 = subprocess.run(cmd0, capture_output=True, text=True)
+        if result0.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < MIN_VALID_IMAGE_BYTES:
+            print(result0.stderr[-1500:])
+            raise RuntimeError("ffmpeg 截取视频封面失败")
+
+    print(f"  封面图截取完成: {os.path.getsize(output_path)} bytes")
+    return output_path
+
+
+def upload_thumbnail(s3, local_path: str, asset_id: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    key = f"{MANUAL_PROCESSED_PREFIX}{asset_id}-pinterest-thumb-{timestamp}.jpg"
+    s3.upload_file(local_path, R2_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"})
+    url = public_url(key)
+    print(f"  已上传封面图: {url}")
+    return url
 
 
 def parse_manual_caption(raw_text: str) -> dict:
@@ -388,9 +440,16 @@ def get_link_for_pin(total_published: int) -> tuple[bool, str | None]:
 
 # ── Buffer GraphQL API ────────────────────────────────────────────────────────
 def create_pin_via_buffer(media_url: str, caption: str, link_url: str | None,
-                           is_video: bool = False, title: str = "") -> str:
+                           is_video: bool = False, title: str = "",
+                           thumbnail_url: str | None = None) -> str:
     """通过 Buffer 的 createPost 发布 Pin。is_video=True 时发视频 Pin（原创素材
-    走这条），否则发图片 Pin（自动生成流程走这条，行为与之前完全一致）。"""
+    走这条），否则发图片 Pin（自动生成流程走这条，行为与之前完全一致）。
+
+    Pinterest 的视频Pin必须额外带一张封面图（Buffer 报错: "Pinterest posts
+    require at least one image"），所以 is_video=True 时 assets 数组里同时
+    放 image（thumbnail_url）和 video 两个 entry，thumbnailUrl 也顺手写进
+    video 对象里做双重保险。
+    """
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
@@ -411,7 +470,16 @@ def create_pin_via_buffer(media_url: str, caption: str, link_url: str | None,
     }
     """
 
-    asset_block = {"video": {"url": media_url}} if is_video else {"image": {"url": media_url}}
+    if is_video:
+        video_block = {"url": media_url}
+        if thumbnail_url:
+            video_block["thumbnailUrl"] = thumbnail_url
+        assets = []
+        if thumbnail_url:
+            assets.append({"image": {"url": thumbnail_url}})
+        assets.append({"video": video_block})
+    else:
+        assets = [{"image": {"url": media_url}}]
 
     variables = {
         "input": {
@@ -419,7 +487,7 @@ def create_pin_via_buffer(media_url: str, caption: str, link_url: str | None,
             "schedulingType": "automatic",
             "mode": "shareNow",
             "text": caption,
-            "assets": [asset_block],
+            "assets": assets,
             "metadata": {
                 "pinterest": {
                     "boardServiceId": PINTEREST_BOARD_ID,
@@ -529,6 +597,7 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
 
     raw_video_key = ""
     video_url = ""
+    thumbnail_url = ""
     try:
         raw_video_key = find_manual_video_key(s3, asset_id)
         print(f"  原创视频（原始文件）: {raw_video_key}")
@@ -544,8 +613,15 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
             normalized_local_path = normalize_video_for_publish(raw_local_path, tmpdir)
             video_url, _processed_key = upload_normalized_manual_video(s3, normalized_local_path, asset_id)
 
+            # Pinterest 的视频Pin必须额外带一张封面图（见 create_pin_via_buffer
+            # 的注释），从处理好的视频里截一帧当封面，跟视频一起上传。
+            thumbnail_local_path = extract_video_thumbnail(normalized_local_path, tmpdir)
+            thumbnail_url = upload_thumbnail(s3, thumbnail_local_path, asset_id)
+
         print(f"  处理后的视频: {video_url}")
-        verify_video_url_ready(video_url)
+        print(f"  封面图: {thumbnail_url}")
+        verify_url_ready(video_url, min_bytes=MIN_VALID_VIDEO_BYTES)
+        verify_url_ready(thumbnail_url, min_bytes=MIN_VALID_IMAGE_BYTES)
 
         # core_hashtags 跟 TikTok 一样是固定的——全部带上，不是从池子里随机抽。
         hashtags = " ".join(style["core_hashtags"])
@@ -567,7 +643,8 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
         print(f"  文案:\n{caption}\n")
 
         print("发布原创视频 Pin via Buffer...")
-        post_id = create_pin_via_buffer(video_url, caption, link_url, is_video=True, title=pin_title)
+        post_id = create_pin_via_buffer(video_url, caption, link_url, is_video=True,
+                                         title=pin_title, thumbnail_url=thumbnail_url)
         print(f"已发布，post ID: {post_id}")
 
         rotation_state["total_published"] = total_published + 1
