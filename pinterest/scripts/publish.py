@@ -589,7 +589,7 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
     total_published（与自动生成流程共享同一个计数器），成功后递增；但不移动
     自动生成流程专用的 index 指针。
     """
-    from generate_caption import generate_caption
+    from generate_caption import generate_caption, fit_caption_to_limit
 
     total_published = rotation_state["total_published"]
     cycle_pos        = total_published % WEEKLY_CYCLE
@@ -632,7 +632,10 @@ def run_manual_publish_pinterest(s3, asset_id: str, product_info: str, style: di
             body = caption_data["description"]
             if include_link and link_url:
                 body += f"\n\n{link_url}"
-            caption = f"{body}\n\n{hashtags}"
+            caption = fit_caption_to_limit(body, hashtags)
+            if len(caption) != len(f"{body}\n\n{hashtags}"):
+                print(f"  ⚠️ 原创文案+hashtag超过500字符上限，已自动截断到 {len(caption)} 字符。"
+                      f"建议手动精简一下 _manual/captions/{asset_id}.txt 里的文案。")
         else:
             print("  没有找到原创文案，调用AI生成...")
             pin_title = ""
