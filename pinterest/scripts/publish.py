@@ -75,12 +75,16 @@ MANUAL_CAPTIONS_PREFIX = "_manual/captions/"
 MANUAL_STATE_KEY        = "_manual/state.json"
 MANUAL_PROCESSED_PREFIX = "_manual/processed/"
 
-HOMEPAGE_URL     = "https://barekey.net"
-PRODUCT_PAGE_URL = "https://barekey.net/products/macbook-key-skin"
+HOMEPAGE_URL      = "https://barekey.net"
+PRODUCT_PAGE_URL  = "https://barekey.net/products/macbook-key-skin"
+ETSY_LISTING_URL  = "https://www.etsy.com/uk/listing/4532962134/macbook-modular-keyboard-skin"
+ETSY_SHOP_URL     = "https://www.etsy.com/uk/shop/BAREKEY?ref=shop_profile&listing_id=4532962134"
 
 WEEKLY_CYCLE     = 21
 HOMEPAGE_POS     = 0
+ETSY_LISTING_POS = 5
 PRODUCT_PAGE_POS = 10
+ETSY_SHOP_POS    = 15
 
 PINTEREST_BOARD_ID = "1117174320005725402"
 
@@ -433,8 +437,12 @@ def get_link_for_pin(total_published: int) -> tuple[bool, str | None]:
     pos = total_published % WEEKLY_CYCLE
     if pos == HOMEPAGE_POS:
         return True, HOMEPAGE_URL
+    elif pos == ETSY_LISTING_POS:
+        return True, ETSY_LISTING_URL
     elif pos == PRODUCT_PAGE_POS:
         return True, PRODUCT_PAGE_URL
+    elif pos == ETSY_SHOP_POS:
+        return True, ETSY_SHOP_URL
     return False, None
 
 
