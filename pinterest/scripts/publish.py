@@ -355,9 +355,6 @@ def main():
             error_msg=error_msg,
         )
         sys.exit(1)
-    finally:
-        delete_tmp(s3, tmp_key)
-        print(f"Cleaned up temp file: {tmp_key}")
 
 
 if __name__ == "__main__":
