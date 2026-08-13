@@ -18,12 +18,142 @@ product_info 和 style 由 publish.py 从 R2 读出后传进来（同样是 TikT
 任何本地或独立的 R2 读取。
 """
 
+import json
 import os
 import random
+import smtplib
 import requests
+from email.mime.text import MIMEText
 
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+QWEN_API_KEY     = os.environ.get("QWEN_API_KEY", "")
+
+# ── LLM fallback chain (DeepSeek → dashscope) ────────────────────────────────
+# 跟 TikTok/YouTube 流水线完全一致的降级链——DeepSeek 余额用完后自动切 dashscope
+# 上的免费额度模型，避免单点故障导致整条流水线挂掉。
+
+_DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+
+_LLM_PROVIDERS = [
+    {
+        "name": "DeepSeek",
+        "url": "https://api.deepseek.com/chat/completions",
+        "key": DEEPSEEK_API_KEY,
+        "model": "deepseek-v4-flash",
+    },
+    # ── dashscope fallbacks ──────────────────────────────────────────────
+    {"name": "DS (v4-pro)",          "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "deepseek-v4-pro"},
+    {"name": "DS (v4-flash)",        "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "deepseek-v4-flash"},
+    {"name": "DS (v3.2)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "deepseek-v3.2"},
+    {"name": "DS (v3.2-exp)",        "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "deepseek-v3.2-exp"},
+    {"name": "DS (v3.1)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "deepseek-v3.1"},
+    {"name": "Qwen (3.7-max)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.7-max"},
+    {"name": "Qwen (3.7-max-0608)",       "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.7-max-2026-06-08"},
+    {"name": "Qwen (3.7-max-0520)",       "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.7-max-2026-05-20"},
+    {"name": "Qwen (3.7-max-preview)",    "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.7-max-preview"},
+    {"name": "Qwen (3.7-flash)",          "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.7-flash"},
+    {"name": "Qwen (3.6-max-preview)",    "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.6-max-preview"},
+    {"name": "Qwen (3.6-plus)",           "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.6-plus"},
+    {"name": "Qwen (3.6-flash)",          "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.6-flash"},
+    {"name": "Qwen (3.6-27b)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.6-27b"},
+    {"name": "Qwen (3.5-plus)",           "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.5-plus"},
+    {"name": "Qwen (3.5-plus-0420)",      "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.5-plus-2026-04-20"},
+    {"name": "Qwen (3.5-plus-0215)",      "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.5-plus-2026-02-15"},
+    {"name": "Qwen (3.5-flash)",          "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3.5-flash"},
+    {"name": "Qwen (3-max)",              "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3-max"},
+    {"name": "Qwen (3-max-preview)",      "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3-max-preview"},
+    {"name": "Qwen (3-max-0123)",         "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen3-max-2026-01-23"},
+    {"name": "GLM (5.2)",                 "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "glm-5.2"},
+    {"name": "GLM (5.1)",                 "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "glm-5.1"},
+    {"name": "GLM (5)",                   "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "glm-5"},
+    {"name": "GLM (4.7)",                 "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "glm-4.7"},
+    {"name": "GLM (4.6)",                 "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "glm-4.6"},
+    {"name": "MiniMax (M2.5)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "MiniMax-M2.5"},
+    {"name": "MiniMax (M2.1)",            "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "MiniMax-M2.1"},
+    {"name": "Qwen (plus)",              "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-plus"},
+    {"name": "Qwen (plus-latest)",       "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-plus-latest"},
+    {"name": "Qwen (plus-1201)",         "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-plus-2025-12-01"},
+    {"name": "Qwen (plus-0911)",         "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-plus-2025-09-11"},
+    {"name": "Qwen (max)",               "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-max"},
+    {"name": "Qwen (turbo)",             "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-turbo"},
+    {"name": "Qwen (long)",              "url": _DASHSCOPE_URL, "key": QWEN_API_KEY, "model": "qwen-long"},
+]
+
+_LLM_LOW_THRESHOLD = 5
+
+
+def _send_llm_warning_email(succeeded_index: int, provider_name: str, total: int):
+    """LLM 备用额度即将耗尽时发送告警邮件。"""
+    remaining = total - succeeded_index - 1
+    failed_count = succeeded_index
+    subject = f"🚨 BAREKEY Pinterest：AI模型备用额度即将耗尽，仅剩 {remaining} 个可用"
+    body = (
+        f"Pinterest 发布系统在生成文案时，前 {failed_count} 个模型全部失败，\n"
+        f"最终靠第 {succeeded_index + 1} 个模型「{provider_name}」才成功。\n\n"
+        f"备用模型总共 {total} 个，已耗尽 {failed_count} 个，还剩 {remaining} 个。\n\n"
+        f"⚠️ 如果剩余模型也用完，文案将无法生成，Pinterest 发布会失败。\n\n"
+        f"请尽快处理：\n"
+        f"1. 登录百炼后台查看各模型免费额度剩余情况\n"
+        f"2. 在代码 _LLM_PROVIDERS 列表中补充新的可用模型\n"
+        f"3. 考虑给 DeepSeek 充值恢复主力模型\n"
+    )
+    try:
+        mail_user = os.environ.get("MAIL_163_USER", "")
+        mail_pass = os.environ.get("MAIL_163_PASS", "")
+        mail_to   = "19801152287@163.com"
+        if not mail_user or not mail_pass:
+            print(f"  ⚠️  邮件凭据未设置，跳过告警邮件")
+            return
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"]    = mail_user
+        msg["To"]      = mail_to
+        with smtplib.SMTP_SSL("smtp.163.com", 465) as server:
+            server.login(mail_user, mail_pass)
+            server.sendmail(mail_user, mail_to, msg.as_string())
+        print(f"  📧 LLM告警邮件已发送：仅剩 {remaining} 个备用模型")
+    except Exception as e:
+        print(f"  ⚠️  LLM告警邮件发送失败: {e}")
+
+
+def _llm_text_request(messages: list, temperature: float = 0.9, max_tokens: int = 400) -> str:
+    """Call an LLM that returns plain text. Tries providers in order until one succeeds."""
+    last_error = None
+    total = len(_LLM_PROVIDERS)
+    for idx, provider in enumerate(_LLM_PROVIDERS):
+        try:
+            response = requests.post(
+                provider["url"],
+                headers={
+                    "Authorization": f"Bearer {provider['key']}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": provider["model"],
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                timeout=60,
+            )
+            if not response.ok:
+                print(f"  ⚠️  {provider['name']} API error {response.status_code}: {response.text[:300]}")
+                raise requests.exceptions.HTTPError(f"{response.status_code}")
+            resp_data = response.json()
+            raw = (resp_data["choices"][0]["message"].get("content") or "").strip()
+            if not raw:
+                raise ValueError("empty content")
+            # Success
+            remaining = total - idx - 1
+            if idx > 0:
+                print(f"  ⚠️  Succeeded on provider #{idx + 1}/{total}: {provider['name']} ({remaining} remaining)")
+            if remaining <= _LLM_LOW_THRESHOLD and idx > 0:
+                _send_llm_warning_email(idx, provider["name"], total)
+            return raw
+        except Exception as e:
+            last_error = e
+            print(f"  ⚠️  {provider['name']} failed: {e}, trying next provider...")
+    raise ValueError(f"All LLM providers failed. Last error: {last_error}")
 
 # Pinterest 平台硬性上限——超过这个数 Buffer 会直接拒绝发布（错误信息：
 # "Pinterest posts cannot exceed 500 characters"）。这是真实平台限制，不是
@@ -135,22 +265,11 @@ Write ONE Pinterest pin description now. Rules:
 - Sound like a real person, not a brand{link_instruction}
 - Output ONLY the caption text, nothing else"""
 
-    response = requests.post(
-        DEEPSEEK_API_URL,
-        headers={
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 400,
-            "temperature": 0.9,
-        },
-        timeout=30,
+    return _llm_text_request(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.9,
+        max_tokens=400,
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
 
 
 def fit_caption_to_limit(body: str, hashtags: str, max_chars: int = PINTEREST_MAX_CAPTION_CHARS) -> str:
