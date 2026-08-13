@@ -26,6 +26,7 @@ jobs:
           R2_BUCKET:                    ${{ secrets.R2_BUCKET }}
           R2_PUBLIC_URL:                "https://pub-f38f66bcaab742dfb6263106bb8c6142.r2.dev"
           DEEPSEEK_API_KEY:             ${{ secrets.DEEPSEEK_API_KEY }}
+          QWEN_API_KEY:                ${{ secrets.QWEN_API_KEY }}
           BUFFER_ACCESS_TOKEN:          ${{ secrets.BUFFER_ACCESS_TOKEN }}
           BUFFER_PINTEREST_CHANNEL_ID:  "6a294b178f1d11f9b26fc257"
           MAIL_163_USER:                ${{ secrets.MAIL_163_USER }}
