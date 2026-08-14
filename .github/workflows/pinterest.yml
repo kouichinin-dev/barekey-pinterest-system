@@ -1,9 +1,7 @@
 name: Pinterest Daily Publish
 on:
   schedule:
-    - cron: "0 8 * * *"   # UTC 08:00 = 上海 16:00
-    - cron: "0 14 * * *"  # UTC 14:00 = 上海 22:00 / 纽约 09:00
-    - cron: "0 20 * * *"  # UTC 20:00 = 上海 04:00 / 伦敦 20:00
+    - cron: "30 0 * * *"  # UTC 00:30 — 每天触发一次，脚本内部随机决定当天发几条、什么时间发
   workflow_dispatch:
 jobs:
   publish:
