@@ -10,11 +10,12 @@ import json
 import os
 import sys
 import io
+import random
 import smtplib
 import time
 import boto3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -57,6 +58,67 @@ PINTEREST_BOARD_ID = "1117174320005725402"
 
 OUTPUT_WIDTH  = 1080
 OUTPUT_HEIGHT = 1920
+
+# ── Daily schedule (randomized post count + timing) ──────────────────────────
+# 每天只触发一次 cron，由这个函数决定当天发几条、每条什么时间发。
+# Buffer 的 customScheduled 模式负责在指定时间实际投递。
+
+PUBLISH_WINDOW_START_H = 0     # UTC 00:00
+PUBLISH_WINDOW_END_H   = 20    # UTC 20:00
+MIN_GAP_SECONDS        = 3 * 3600   # 帖子之间最少间隔 3 小时
+
+
+def calculate_daily_schedule(weekday_range=(2, 3), weekend_range=(3, 4)) -> list:
+    """Return a sorted list of due_at ISO 8601 strings for today's posts.
+
+    Picks a random post count based on day-of-week, then distributes
+    that many posts randomly across the publishing window with minimum
+    spacing.  Each due_at is at least 10 minutes in the future so
+    Buffer has time to process the post before the scheduled time.
+    """
+    now = datetime.utcnow()
+    is_weekend = now.weekday() >= 5   # Sat=5, Sun=6
+
+    lo, hi = weekend_range if is_weekend else weekday_range
+    num_posts = random.randint(lo, hi)
+
+    window_start = max(
+        now + timedelta(minutes=10),
+        now.replace(hour=PUBLISH_WINDOW_START_H, minute=0, second=0, microsecond=0),
+    )
+    window_end = now.replace(hour=PUBLISH_WINDOW_END_H, minute=0, second=0, microsecond=0)
+    if window_end <= window_start:
+        # Past today's window — push everything to tomorrow
+        window_end += timedelta(days=1)
+        window_start = max(
+            now + timedelta(minutes=10),
+            window_end - timedelta(hours=PUBLISH_WINDOW_END_H - PUBLISH_WINDOW_START_H),
+        )
+
+    window_seconds = int((window_end - window_start).total_seconds())
+
+    times = []
+    for _ in range(num_posts):
+        placed = False
+        for _attempt in range(200):
+            offset = random.randint(0, max(0, window_seconds))
+            candidate = window_start + timedelta(seconds=offset)
+            if all(abs((candidate - t).total_seconds()) >= MIN_GAP_SECONDS for t in times):
+                times.append(candidate)
+                placed = True
+                break
+        if not placed:
+            offset = random.randint(0, max(0, window_seconds))
+            times.append(window_start + timedelta(seconds=offset))
+
+    times.sort()
+    due_ats = [t.strftime("%Y-%m-%dT%H:%M:%S.000Z") for t in times]
+
+    day_label = "Weekend" if is_weekend else "Weekday"
+    time_labels = [t.strftime("%H:%M") for t in times]
+    print(f"  📅 {day_label} schedule: {num_posts} post(s) at {time_labels} UTC")
+
+    return due_ats
 
 
 # ── R2 helpers ────────────────────────────────────────────────────────────────
@@ -168,7 +230,7 @@ def get_link_for_pin(total_published: int) -> tuple[bool, str | None]:
 
 # ── Buffer GraphQL API ────────────────────────────────────────────────────────
 def create_pin_via_buffer(image_url: str, caption: str, link_url: str | None,
-                           title: str = "") -> str:
+                           title: str = "", due_at: str = None) -> str:
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
@@ -191,22 +253,24 @@ def create_pin_via_buffer(image_url: str, caption: str, link_url: str | None,
 
     assets = [{"image": {"url": image_url}}]
 
-    variables = {
-        "input": {
-            "channelId": BUFFER_CHANNEL_ID,
-            "schedulingType": "automatic",
-            "mode": "addToQueue",
-            "text": caption,
-            "assets": assets,
-            "metadata": {
-                "pinterest": {
-                    "boardServiceId": PINTEREST_BOARD_ID,
-                    "title": title,
-                    **({"url": link_url} if link_url else {}),
-                }
-            },
-        }
+    post_input = {
+        "channelId": BUFFER_CHANNEL_ID,
+        "schedulingType": "automatic",
+        "mode": "customScheduled" if due_at else "addToQueue",
+        "text": caption,
+        "assets": assets,
+        "metadata": {
+            "pinterest": {
+                "boardServiceId": PINTEREST_BOARD_ID,
+                "title": title,
+                **({"url": link_url} if link_url else {}),
+            }
+        },
     }
+    if due_at:
+        post_input["dueAt"] = due_at
+
+    variables = {"input": post_input}
 
     headers = {
         "Authorization": f"Bearer {BUFFER_TOKEN}",
@@ -286,6 +350,68 @@ Post ID: {post_id}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def publish_one_pin(s3, rotation_state: dict, all_images: list,
+                     product_info: str, style: dict, generate_caption,
+                     due_at: str = None) -> bool:
+    """Publish a single pin. Returns True on success, False on failure.
+    Updates rotation_state in place and saves to R2 on success."""
+
+    current_index   = rotation_state["index"] % len(all_images)
+    total_published = rotation_state["total_published"]
+    cycle_pos       = total_published % WEEKLY_CYCLE
+
+    print(f"  Cycle position: {cycle_pos + 1}/{WEEKLY_CYCLE}")
+
+    image_key = all_images[current_index]
+    print(f"  Selected image: {image_key} (index {current_index}/{len(all_images)})")
+
+    include_link, link_url = get_link_for_pin(total_published)
+    if include_link:
+        print(f"  This pin includes link: {link_url}")
+    else:
+        print(f"  This pin has no link")
+
+    print("  Generating caption...")
+    caption = generate_caption(product_info, style, include_link=include_link, link_url=link_url)
+    print(f"  Caption:\n{caption}\n")
+
+    print("  Cropping image to 9:16...")
+    tmp_key, image_url = crop_to_9_16(s3, image_key)
+    print(f"  Cropped image URL: {image_url}")
+
+    try:
+        schedule_label = f" (scheduled {due_at})" if due_at else ""
+        print(f"  Publishing via Buffer...{schedule_label}")
+        post_id = create_pin_via_buffer(image_url, caption, link_url, due_at=due_at)
+        print(f"  Published post ID: {post_id}")
+
+        rotation_state["index"]           = (current_index + 1) % len(all_images)
+        rotation_state["total_published"] = total_published + 1
+        rotation_state["last_published"]  = datetime.utcnow().isoformat()
+        rotation_state["last_post_id"]    = post_id
+        rotation_state["last_image"]      = image_key
+        save_state(s3, rotation_state)
+
+        send_report(
+            success=True, post_id=post_id, media_key=image_key,
+            media_url=image_url, caption=caption, link_url=link_url,
+            cycle_pos=cycle_pos, total_published=total_published,
+        )
+        print(f"  Done. Total published: {rotation_state['total_published']}")
+        return True
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"  ERROR: {error_msg}")
+        send_report(
+            success=False, post_id="", media_key=image_key,
+            media_url=image_url, caption=caption, link_url=link_url,
+            cycle_pos=cycle_pos, total_published=total_published,
+            error_msg=error_msg,
+        )
+        return False
+
+
 def main():
     print(f"[{datetime.utcnow().isoformat()}] Pinterest publish starting")
 
@@ -301,60 +427,23 @@ def main():
     if not all_images:
         print("ERROR: No images found in R2 pics/")
         sys.exit(1)
-    print(f"Found {len(all_images)} images in pics/")
+    print(f"Found {len(all_images)} images in {IMAGE_PREFIX}")
 
-    current_index   = rotation_state["index"] % len(all_images)
-    total_published = rotation_state["total_published"]
-    cycle_pos       = total_published % WEEKLY_CYCLE
+    schedule = calculate_daily_schedule()
 
-    print(f"Cycle position: {cycle_pos + 1}/{WEEKLY_CYCLE}")
+    failures = []
+    for i, due_at in enumerate(schedule):
+        print(f"\n📦 Pin {i+1}/{len(schedule)} — scheduled for {due_at}")
+        ok = publish_one_pin(s3, rotation_state, all_images, product_info,
+                              style, generate_caption, due_at=due_at)
+        if not ok:
+            failures.append(i + 1)
 
-    image_key = all_images[current_index]
-    print(f"Selected image: {image_key} (index {current_index}/{len(all_images)})")
-
-    include_link, link_url = get_link_for_pin(total_published)
-    if include_link:
-        print(f"This pin includes link: {link_url}")
-    else:
-        print("This pin has no link")
-
-    print("Generating caption...")
-    caption = generate_caption(product_info, style, include_link=include_link, link_url=link_url)
-    print(f"Caption:\n{caption}\n")
-
-    print("Cropping image to 9:16...")
-    tmp_key, image_url = crop_to_9_16(s3, image_key)
-    print(f"Cropped image URL: {image_url}")
-
-    try:
-        print("Publishing via Buffer...")
-        post_id = create_pin_via_buffer(image_url, caption, link_url)
-        print(f"Published post ID: {post_id}")
-
-        rotation_state["index"]           = (current_index + 1) % len(all_images)
-        rotation_state["total_published"] = total_published + 1
-        rotation_state["last_published"]  = datetime.utcnow().isoformat()
-        rotation_state["last_post_id"]    = post_id
-        rotation_state["last_image"]      = image_key
-        save_state(s3, rotation_state)
-
-        send_report(
-            success=True, post_id=post_id, media_key=image_key,
-            media_url=image_url, caption=caption, link_url=link_url,
-            cycle_pos=cycle_pos, total_published=total_published,
-        )
-        print(f"Done. Total published: {rotation_state['total_published']}")
-
-    except Exception as e:
-        error_msg = str(e)
-        print(f"ERROR: {error_msg}")
-        send_report(
-            success=False, post_id="", media_key=image_key,
-            media_url=image_url, caption=caption, link_url=link_url,
-            cycle_pos=cycle_pos, total_published=total_published,
-            error_msg=error_msg,
-        )
+    if failures:
+        print(f"\n❌ {len(failures)}/{len(schedule)} pin(s) failed: #{', #'.join(str(f) for f in failures)}")
         sys.exit(1)
+
+    print(f"\n✅ All {len(schedule)} pin(s) scheduled successfully.")
 
 
 if __name__ == "__main__":
